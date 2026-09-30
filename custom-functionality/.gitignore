@@ -1,0 +1,7 @@
+/build/
+/src/material_profiles.inc
+/analysis/*
+!/analysis/README.md
+/esphome/.esphome/
+/esphome/secrets.yaml
+/.venv-ota/

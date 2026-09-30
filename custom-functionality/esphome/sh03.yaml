@@ -1,0 +1,710 @@
+# Copy this entire file into ESPHome Device Builder for filament-dryer-01.
+# Keep the existing secrets.yaml there; credentials are never stored here.
+substitutions:
+  name: filament-dryer-01
+  friendly_name: filament-dryer-01
+  uart_rx_pin: GPIO21
+  uart_tx_pin: GPIO20
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # UART is ready (BUS priority); this runs before Wi-Fi setup (250).
+    priority: 500
+    then:
+      - lambda: |-
+          id(wire_sequence) = static_cast<uint16_t>(random_uint32());
+          id(recovery_boot_id) = random_uint32();
+          id(uart_connected).publish_state(false);
+          id(last_command).publish_state("Waiting for dryer");
+          // Only an explicitly armed recovery survives a shared power cycle.
+          // Consume the marker once; normal drying commands are never stored.
+          auto preference = global_preferences->make_preference<uint32_t>(0x53335230, true);
+          uint32_t marker = 0;
+          if (preference.load(&marker) && marker == 0x53335231) {
+            marker = 0;
+            id(recovery_saved) = preference.save(&marker) && global_preferences->sync();
+            id(recovery_hold) = true;
+            id(recovery_started) = millis();
+            id(ota_active) = true;
+            id(last_command).publish_state("Recovery: waiting for uploader");
+            id(sh03_boot_control).execute(0x11);
+          }
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+wifi:
+  power_save_mode: none
+  output_power: 8.5dB
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret wifi_ssid_2
+      password: !secret wifi_password
+  reboot_timeout: 0s
+
+api:
+  encryption:
+    key: !secret filament_dryer_01__api_key
+  reboot_timeout: 0s
+  # Authenticated native API -> bounded UART bootloader packets. The uploader
+  # waits for MCU replies; this action never claims that flashing succeeded.
+  actions:
+    - action: sh03_ota_packet
+      variables:
+        operation: int
+        sequence: int
+        payload: int[]
+      then:
+        - lambda: |-
+            if (sequence < 0 || sequence > 65535 || payload.size() > 64) return;
+            const bool empty_op = operation == 0x10 || operation == 0x11 ||
+              operation == 0x14 || operation == 0x15 || operation == 0x17;
+            if (!((empty_op && payload.empty()) || (operation == 0x12 && payload.size() == 16) ||
+                  (operation == 0x13 && payload.size() >= 6 && !(payload.size() & 1)))) return;
+            for (int value : payload) if (value < 0 || value > 255) return;
+            if (id(pending)) {
+              id(last_command).publish_state("OTA: wait for pending command");
+              return;
+            }
+            // The connected uploader now owns UART; stop autonomous probes.
+            id(recovery_hold) = false;
+            id(ota_activity) = millis();
+            if (operation != 0x17) id(ota_active) = true;
+            uint8_t frame[73] = {0xA5, 0x5A, 1, static_cast<uint8_t>(operation),
+              static_cast<uint8_t>(sequence), static_cast<uint8_t>(sequence >> 8),
+              static_cast<uint8_t>(payload.size())};
+            for (size_t i = 0; i < payload.size(); ++i) frame[7 + i] = payload[i];
+            const size_t length = payload.size() + 9;
+            uint16_t crc = 0xFFFF;
+            for (size_t i = 2; i < length - 2; ++i) {
+              crc ^= static_cast<uint16_t>(frame[i]) << 8;
+              for (unsigned bit = 0; bit < 8; ++bit)
+                crc = static_cast<uint16_t>((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+            }
+            frame[length - 2] = crc;
+            frame[length - 1] = crc >> 8;
+            id(dryer_uart).write_array(frame, length);
+    - action: sh03_ota_release
+      then:
+        - lambda: |-
+            id(ota_active) = false;
+    - action: sh03_ota_recovery
+      variables:
+        command: int  # 0=status, 1=arm next shared power cycle, 2=cancel
+      supports_response: only
+      then:
+        - lambda: |-
+            id(recovery_saved) = command >= 0 && command <= 2;
+            if (command == 1 || command == 2) {
+              auto preference = global_preferences->make_preference<uint32_t>(0x53335230, true);
+              uint32_t marker = command == 1 ? 0x53335231 : 0;
+              // A successful API response means the marker is in NVS already.
+              id(recovery_saved) = preference.save(&marker) && global_preferences->sync();
+            }
+            if (command == 2) {
+              if (id(recovery_hold)) id(sh03_boot_control).execute(0x15);
+              id(recovery_hold) = false;
+              id(ota_active) = false;
+            }
+        - api.respond:
+            success: !lambda return id(recovery_saved);
+            error_message: !lambda 'return id(recovery_saved) ? "" : "Cannot persist recovery marker";'
+            data: |-
+              root["boot_id"] = id(recovery_boot_id);
+              root["holding"] = id(recovery_hold);
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  # Native USB logging stays available even before Wi-Fi connects.
+  # GPIO20/21 remain dedicated to the dryer UART.
+  hardware_uart: USB_SERIAL_JTAG
+  baud_rate: 115200
+  level: DEBUG
+
+# Entire bridge lives in this YAML. Only RX/TX + common GND to SH03.
+# OTA enters the bootloader through a UART command; no reset GPIO is used.
+# No external_components or includes.
+uart:
+  id: dryer_uart
+  tx_pin: ${uart_tx_pin}
+  rx_pin: ${uart_rx_pin}
+  baud_rate: 115200
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+
+# Protocol/drying state is volatile. Only the explicit recovery marker above
+# uses NVS; it is consumed on the next boot, not restored as a drying command.
+globals:
+  - id: recovery_boot_id
+    type: 'uint32_t'
+    restore_value: false
+    initial_value: '0'
+  - id: recovery_hold
+    type: 'bool'
+    restore_value: false
+    initial_value: 'false'
+  - id: recovery_saved
+    type: 'bool'
+    restore_value: false
+    initial_value: 'false'
+  - id: recovery_started
+    type: 'uint32_t'
+    restore_value: false
+    initial_value: '0'
+  - id: ota_active
+    type: 'bool'
+    restore_value: false
+    initial_value: 'false'
+  - id: ota_activity
+    type: 'uint32_t'
+    restore_value: false
+    initial_value: '0'
+  - id: ota_reply_counter
+    type: 'uint32_t'
+    restore_value: false
+    initial_value: '0'
+  - id: wire_sequence
+    type: 'uint16_t'
+    restore_value: false
+    initial_value: '0'
+  - id: seen
+    type: 'std::array<bool, 2>'
+    restore_value: false
+    initial_value: '{false, false}'
+  - id: last_seen
+    type: 'std::array<uint32_t, 2>'
+    restore_value: false
+    initial_value: '{0, 0}'
+  - id: pending
+    type: 'bool'
+    restore_value: false
+    initial_value: 'false'
+  - id: pending_sequence
+    type: 'uint16_t'
+    restore_value: false
+    initial_value: '0'
+  - id: pending_chamber
+    type: 'uint8_t'
+    restore_value: false
+    initial_value: '0'
+  - id: pending_operation
+    type: 'uint8_t'
+    restore_value: false
+    initial_value: '0'
+  - id: sent_at
+    type: 'uint32_t'
+    restore_value: false
+    initial_value: '0'
+
+# ch=-1 sends QUERY; ch=0/1 sends a single acknowledged command.
+script:
+  - id: sh03_command
+    mode: single
+    parameters:
+      ch: int
+      operation: int
+      value: int
+    then:
+      - lambda: |-
+          const bool query = ch == -1;
+          if (id(ota_active)) {
+            if (!query) id(last_command).publish_state("Rejected: firmware update in progress");
+            return;
+          }
+          if (!query) {
+            if (ch < 0 || ch > 1 || !id(seen)[ch] || millis() - id(last_seen)[ch] > 5000) {
+              id(last_command).publish_state("Rejected: dryer disconnected");
+              return;
+            }
+            if (id(pending)) {
+              id(last_command).publish_state("Rejected: previous command pending");
+              return;
+            }
+          }
+          const uint16_t sequence = ++id(wire_sequence);
+          uint8_t frame[15] = {0xA5, 0x5A, 1, static_cast<uint8_t>(query ? 4 : 2),
+            static_cast<uint8_t>(sequence), static_cast<uint8_t>(sequence >> 8),
+            static_cast<uint8_t>(query ? 0 : 6)};
+          const size_t length = query ? 9 : 15;
+          if (!query) {
+            frame[7] = static_cast<uint8_t>(ch);
+            frame[8] = static_cast<uint8_t>(operation);
+            const uint32_t v = static_cast<uint32_t>(value);
+            for (unsigned i = 0; i < 4; ++i) frame[9 + i] = static_cast<uint8_t>(v >> (8 * i));
+          }
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 2; i < length - 2; ++i) {
+            crc ^= static_cast<uint16_t>(frame[i]) << 8;
+            for (unsigned bit = 0; bit < 8; ++bit)
+              crc = static_cast<uint16_t>((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+          }
+          frame[length - 2] = static_cast<uint8_t>(crc);
+          frame[length - 1] = static_cast<uint8_t>(crc >> 8);
+          if (!query) {
+            id(pending) = true;
+            id(pending_sequence) = sequence;
+            id(pending_chamber) = ch;
+            id(pending_operation) = operation;
+            id(sent_at) = millis();
+            id(last_command).publish_state("Pending");
+          }
+          id(dryer_uart).write_array(frame, length);
+
+  - id: sh03_boot_control
+    mode: single
+    parameters:
+      operation: int
+    then:
+      - lambda: |-
+          if (operation != 0x11 && operation != 0x15) return;
+          const uint16_t sequence = ++id(wire_sequence);
+          uint8_t frame[9] = {0xA5, 0x5A, 1, static_cast<uint8_t>(operation),
+            static_cast<uint8_t>(sequence), static_cast<uint8_t>(sequence >> 8), 0};
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 2; i < 7; ++i) {
+            crc ^= static_cast<uint16_t>(frame[i]) << 8;
+            for (unsigned bit = 0; bit < 8; ++bit)
+              crc = static_cast<uint16_t>((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+          }
+          frame[7] = crc;
+          frame[8] = crc >> 8;
+          id(dryer_uart).write_array(frame, sizeof(frame));
+
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (!id(recovery_hold)) return;
+          if (millis() - id(recovery_started) >= 300000) {
+            id(recovery_hold) = false;
+            id(ota_active) = false;
+            id(sh03_boot_control).execute(0x15);
+            id(last_command).publish_state("Recovery expired: run uploader again");
+            return;
+          }
+          // Local keepalive is independent of Wi-Fi and Home Assistant.
+          id(sh03_boot_control).execute(0x11);
+  - interval: 5s
+    then:
+      - lambda: |-
+          id(sh03_command).execute(-1, 0, 0);
+  - interval: 10ms
+    then:
+      - lambda: |-
+          // UART v1: A5 5A version type sequence-LE16 length payload CRC-LE16.
+          // Bounded sliding parser; CRC-16/CCITT-FALSE excludes sync bytes.
+          static uint8_t buffer[73];
+          static size_t used = 0;
+          static uint32_t last_rx = 0;
+          const auto get16 = [](const uint8_t *p) -> uint16_t {
+            return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+          };
+          const auto get32 = [&get16](const uint8_t *p) -> uint32_t {
+            return static_cast<uint32_t>(get16(p)) | (static_cast<uint32_t>(get16(p + 2)) << 16);
+          };
+          const auto crc16 = [](const uint8_t *p, size_t n) -> uint16_t {
+            uint16_t crc = 0xFFFF;
+            while (n--) {
+              crc ^= static_cast<uint16_t>(*p++) << 8;
+              for (unsigned bit = 0; bit < 8; ++bit)
+                crc = static_cast<uint16_t>((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+            }
+            return crc;
+          };
+          const auto discard = [](size_t count) {
+            for (size_t i = count; i < used; ++i) buffer[i - count] = buffer[i];
+            used -= count;
+          };
+          sensor::Sensor *sensors[2][6] = {
+            {id(ch1_temperature), id(ch1_humidity), id(ch1_heater_temperature),
+             id(ch1_fan_rpm), id(ch1_remaining_time), id(ch1_heater_power)},
+            {id(ch2_temperature), id(ch2_humidity), id(ch2_heater_temperature),
+             id(ch2_fan_rpm), id(ch2_remaining_time), id(ch2_heater_power)}
+          };
+          switch_::Switch *running[2] = {id(ch1_running), id(ch2_running)};
+          binary_sensor::BinarySensor *drying[2] = {id(ch1_drying), id(ch2_drying)};
+          text_sensor::TextSensor *fault[2] = {id(ch1_fault), id(ch2_fault)};
+          number::Number *target[2] = {id(ch1_target_temperature), id(ch2_target_temperature)};
+          number::Number *duration[2] = {id(ch1_duration), id(ch2_duration)};
+          number::Number *threshold[2] = {id(ch1_humidity_threshold), id(ch2_humidity_threshold)};
+          select::Select *mode[2] = {id(ch1_mode), id(ch2_mode)};
+          select::Select *material[2] = {id(ch1_material), id(ch2_material)};
+          static const char *const results[] = {"Accepted", "Invalid value",
+            "Busy: stop drying or finish panel editing", "Dryer fault: inspect the dryer",
+            "Dryer starting", "Unsupported in this mode"};
+          static const char *const faults[] = {"Fan slow", "Fan stopped", "Heater too hot",
+            "Heater too cold", "NTC high", "NTC low", "Actuator A", "Actuator B",
+            "Sensor fault", "Sensor fault", "None"};
+
+          if (millis() - last_rx > 500) used = 0;
+          // Bound work so a noisy UART cannot starve ESPHome/Wi-Fi.
+          for (unsigned count = 0; count < 256 && id(dryer_uart).available(); ++count) {
+            uint8_t byte;
+            if (!id(dryer_uart).read_byte(&byte)) break;
+            last_rx = millis();
+            if (used == sizeof(buffer)) discard(1);
+            buffer[used++] = byte;
+            while (used) {
+              if (buffer[0] != 0xA5 || (used > 1 && buffer[1] != 0x5A) ||
+                  (used > 2 && buffer[2] != 1) || (used > 6 && buffer[6] > 64)) {
+                discard(1);
+                continue;
+              }
+              if (used < 7) break;
+              const size_t length = buffer[6] + 9;
+              if (used < length) break;
+              if (get16(buffer + length - 2) != crc16(buffer + 2, length - 4)) {
+                discard(1);
+                continue;
+              }
+              const uint8_t *p = buffer + 7;
+              if (buffer[3] == 0x18 && buffer[6] == 18) {
+                char message[128];
+                // Counter forces delivery even when a lost ACK is retransmitted.
+                snprintf(message, sizeof(message), "%lu,%u,%u,%u,%lu,%lu,%lu,%lu",
+                  static_cast<unsigned long>(++id(ota_reply_counter)),
+                  static_cast<unsigned>(get16(buffer + 4)), static_cast<unsigned>(p[0]),
+                  static_cast<unsigned>(p[1]), static_cast<unsigned long>(get32(p + 2)),
+                  static_cast<unsigned long>(get32(p + 6)), static_cast<unsigned long>(get32(p + 10)),
+                  static_cast<unsigned long>(get32(p + 14)));
+                id(sh03_ota_reply).publish_state(message);
+              } else if (buffer[3] == 3 && buffer[6] == 3 && id(pending) &&
+                  get16(buffer + 4) == id(pending_sequence) &&
+                  p[0] == id(pending_chamber) && p[1] == id(pending_operation)) {
+                id(pending) = false;
+                id(last_command).publish_state(p[2] < 6 ? results[p[2]] : "Unknown reply");
+              } else if (buffer[3] == 1 && buffer[6] == 30 && p[0] < 2 && p[2] < 2 && p[3] < 10) {
+                const uint8_t ch = p[0];
+                id(seen)[ch] = true;
+                id(last_seen)[ch] = millis();
+                const float values[6] = {static_cast<int16_t>(get16(p + 8)) / 10.0f,
+                  static_cast<float>(get16(p + 10)), static_cast<float>(static_cast<int16_t>(get16(p + 12))),
+                  static_cast<float>(get32(p + 14)), get32(p + 26) / 60.0f, static_cast<float>(p[7])};
+                for (unsigned i = 0; i < 6; ++i) sensors[ch][i]->publish_state(values[i]);
+                running[ch]->publish_state((p[1] & 1) != 0);
+                drying[ch]->publish_state((p[1] & 2) != 0);
+                // Older SH03 firmware has no display-state capability bit.
+                if (p[1] & 32) id(displays_enabled).publish_state((p[1] & 16) != 0);
+                fault[ch]->publish_state(p[6] < 11 ? faults[p[6]] : "Unknown fault");
+                target[ch]->publish_state(p[4]);
+                duration[ch]->publish_state(get32(p + 18) / 3600.0f);
+                threshold[ch]->publish_state(p[5]);
+                mode[ch]->publish_state(mode[ch]->at(p[2]).value());
+                material[ch]->publish_state(material[ch]->at(p[3]).value());
+              }
+              discard(length);
+            }
+          }
+          // Read time again: it may have advanced during RX/publishing.
+          const uint32_t now = millis();
+          if (id(ota_active) && !id(recovery_hold) && now - id(ota_activity) > 60000) id(ota_active) = false;
+          for (uint8_t ch = 0; ch < 2; ++ch) {
+            if (id(seen)[ch] && now - id(last_seen)[ch] > 5000) {
+              id(seen)[ch] = false;
+              for (auto *sensor : sensors[ch]) sensor->publish_state(NAN);
+              fault[ch]->publish_state("Disconnected");
+            }
+          }
+          const bool online = id(seen)[0] && id(seen)[1];
+          if (!id(uart_connected).has_state() || id(uart_connected).state != online)
+            id(uart_connected).publish_state(online);
+          if (id(pending) && now - id(sent_at) > 2000) {
+            id(pending) = false;
+            id(last_command).publish_state("Timeout: check actual dryer state");
+          }
+
+binary_sensor:
+  - platform: template
+    id: uart_connected
+    name: UART connected
+    device_class: connectivity
+  - platform: template
+    id: ch1_drying
+    name: Chamber 1 actively drying
+  - platform: template
+    id: ch2_drying
+    name: Chamber 2 actively drying
+
+text_sensor:
+  - platform: template
+    id: sh03_ota_reply
+    name: SH03 OTA reply
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: last_command
+    name: Last command
+    update_interval: never
+  - platform: template
+    id: ch1_fault
+    name: Chamber 1 fault
+    update_interval: never
+  - platform: template
+    id: ch2_fault
+    name: Chamber 2 fault
+    update_interval: never
+
+sensor:
+  - platform: template
+    id: ch1_temperature
+    name: Chamber 1 temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+    device_class: temperature
+  - platform: template
+    id: ch1_humidity
+    name: Chamber 1 humidity
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: humidity
+  - platform: template
+    id: ch1_heater_temperature
+    name: Chamber 1 heater temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: temperature
+  - platform: template
+    id: ch1_fan_rpm
+    name: Chamber 1 fan speed
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch1_remaining_time
+    name: Chamber 1 remaining time
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: duration
+  - platform: template
+    id: ch1_heater_power
+    name: Chamber 1 heater power
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch2_temperature
+    name: Chamber 2 temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+    device_class: temperature
+  - platform: template
+    id: ch2_humidity
+    name: Chamber 2 humidity
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: humidity
+  - platform: template
+    id: ch2_heater_temperature
+    name: Chamber 2 heater temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: temperature
+  - platform: template
+    id: ch2_fan_rpm
+    name: Chamber 2 fan speed
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: ch2_remaining_time
+    name: Chamber 2 remaining time
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    device_class: duration
+  - platform: template
+    id: ch2_heater_power
+    name: Chamber 2 heater power
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+
+# Publish only values received from the dryer; never assume a command succeeded.
+switch:
+  - platform: template
+    id: displays_enabled
+    name: Displays enabled
+    icon: mdi:monitor
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          id(sh03_command).execute(0, 7, 1);
+    turn_off_action:
+      - lambda: |-
+          id(sh03_command).execute(0, 7, 0);
+  - platform: template
+    id: ch1_running
+    name: Chamber 1 drying enabled
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          id(sh03_command).execute(0, 1, 1);
+    turn_off_action:
+      - lambda: |-
+          id(sh03_command).execute(0, 1, 0);
+  - platform: template
+    id: ch2_running
+    name: Chamber 2 drying enabled
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          id(sh03_command).execute(1, 1, 1);
+    turn_off_action:
+      - lambda: |-
+          id(sh03_command).execute(1, 1, 0);
+
+number:
+  - platform: template
+    id: ch1_target_temperature
+    name: Chamber 1 target temperature
+    unit_of_measurement: "°C"
+    min_value: 45
+    max_value: 85
+    step: 1
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(0, 2, static_cast<int>(std::lround(x * 1.0f)));
+  - platform: template
+    id: ch1_duration
+    name: Chamber 1 duration
+    unit_of_measurement: "h"
+    min_value: 2
+    max_value: 98
+    step: 2
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(0, 3, static_cast<int>(std::lround(x * 3600.0f)));
+  - platform: template
+    id: ch1_humidity_threshold
+    name: Chamber 1 humidity threshold
+    unit_of_measurement: "%"
+    min_value: 20
+    max_value: 40
+    step: 5
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(0, 5, static_cast<int>(std::lround(x * 1.0f)));
+  - platform: template
+    id: ch2_target_temperature
+    name: Chamber 2 target temperature
+    unit_of_measurement: "°C"
+    min_value: 45
+    max_value: 85
+    step: 1
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(1, 2, static_cast<int>(std::lround(x * 1.0f)));
+  - platform: template
+    id: ch2_duration
+    name: Chamber 2 duration
+    unit_of_measurement: "h"
+    min_value: 2
+    max_value: 98
+    step: 2
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(1, 3, static_cast<int>(std::lround(x * 3600.0f)));
+  - platform: template
+    id: ch2_humidity_threshold
+    name: Chamber 2 humidity threshold
+    unit_of_measurement: "%"
+    min_value: 20
+    max_value: 40
+    step: 5
+    update_interval: never
+    # An empty state lambda prevents publishing a made-up initial value.
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          if (std::isfinite(x)) id(sh03_command).execute(1, 5, static_cast<int>(std::lround(x * 1.0f)));
+
+select:
+  - platform: template
+    id: ch1_mode
+    name: Chamber 1 mode
+    options: [Timed, Humidity]
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          auto index = id(ch1_mode).index_of(x);
+          if (index.has_value()) id(sh03_command).execute(0, 4, static_cast<int>(*index));
+  - platform: template
+    id: ch1_material
+    name: Chamber 1 material
+    options: [PLA, PETG, ABS, TPU, PVA, ASA, PA, PP, PC, PET]
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          auto index = id(ch1_material).index_of(x);
+          if (index.has_value()) id(sh03_command).execute(0, 6, static_cast<int>(*index));
+  - platform: template
+    id: ch2_mode
+    name: Chamber 2 mode
+    options: [Timed, Humidity]
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          auto index = id(ch2_mode).index_of(x);
+          if (index.has_value()) id(sh03_command).execute(1, 4, static_cast<int>(*index));
+  - platform: template
+    id: ch2_material
+    name: Chamber 2 material
+    options: [PLA, PETG, ABS, TPU, PVA, ASA, PA, PP, PC, PET]
+    update_interval: never
+    lambda: return {};
+    set_action:
+      - lambda: |-
+          auto index = id(ch2_material).index_of(x);
+          if (index.has_value()) id(sh03_command).execute(1, 6, static_cast<int>(*index));

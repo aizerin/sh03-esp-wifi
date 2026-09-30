@@ -1,0 +1,52 @@
+[
+  {
+    "name": "PLA",
+    "temperature_c": 50,
+    "duration_seconds": 28800
+  },
+  {
+    "name": "PETG",
+    "temperature_c": 65,
+    "duration_seconds": 28800
+  },
+  {
+    "name": "ABS",
+    "temperature_c": 80,
+    "duration_seconds": 43200
+  },
+  {
+    "name": "TPU",
+    "temperature_c": 70,
+    "duration_seconds": 28800
+  },
+  {
+    "name": "PVA",
+    "temperature_c": 50,
+    "duration_seconds": 28800
+  },
+  {
+    "name": "ASA",
+    "temperature_c": 80,
+    "duration_seconds": 43200
+  },
+  {
+    "name": "PA",
+    "temperature_c": 80,
+    "duration_seconds": 43200
+  },
+  {
+    "name": "PP",
+    "temperature_c": 55,
+    "duration_seconds": 28800
+  },
+  {
+    "name": "PC",
+    "temperature_c": 80,
+    "duration_seconds": 43200
+  },
+  {
+    "name": "PET",
+    "temperature_c": 80,
+    "duration_seconds": 43200
+  }
+]
