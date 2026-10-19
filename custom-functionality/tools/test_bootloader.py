@@ -6,19 +6,21 @@ actual analogue flash timing and instruction stalls remain board tests.
 """
 import binascii,collections,struct,zlib
 from pathlib import Path
+from build_config import BOARD,RAM_BYTES,RAM_END
 from unicorn import Uc,UC_ARCH_ARM,UC_MODE_THUMB,UC_MODE_MCLASS,UC_HOOK_CODE,UC_HOOK_MEM_READ,UC_HOOK_MEM_WRITE
 from unicorn.arm_const import UC_ARM_REG_SP,UC_ARM_REG_PC,UC_ARM_REG_XPSR
 ROOT=Path(__file__).resolve().parents[1]
 BASE=0x08000000;APP=BASE+0x2000;UART=0x40004c00;FLASH=0x40022000
+CORE=0x410fc241 if BOARD=='m4-48k' else 0x411fc231
 
 def frame(op,seq,p=b''):
     body=bytes([1,op])+struct.pack('<H',seq)+bytes([len(p)])+p
     return b'\xa5\x5a'+body+struct.pack('<H',binascii.crc_hqx(body,0xffff))
 
 class Board:
-    def __init__(self,geometry=256,device_id=0,cpuid=0x411fc231):
+    def __init__(self,geometry=256,device_id=0,cpuid=CORE):
         self.uc=Uc(UC_ARCH_ARM,UC_MODE_THUMB|UC_MODE_MCLASS)
-        for base,size in [(BASE,0x40000),(0x20000000,0x10000),(0x40000000,0x23000),
+        for base,size in [(BASE,0x40000),(0x20000000,RAM_BYTES),(0x40000000,0x23000),
                           (0xe000e000,0x2000),(0xe0042000,0x1000),(0x1ffff000,0x1000)]:self.uc.mem_map(base,size)
         self.original=(ROOT/'build/ota/factory.bin').read_bytes();self.uc.mem_write(BASE,self.original)
         # STM32F1 ES0340: normal execution reads DBGMCU_IDCODE as zero.
@@ -39,7 +41,8 @@ class Board:
         self.uc.hook_add(UC_HOOK_MEM_WRITE,self.write,None,0x40000000,0x40022fff)
         self.uc.hook_add(UC_HOOK_MEM_WRITE,self.program,None,BASE,BASE+0x3ffff)
         self.uc.hook_add(UC_HOOK_CODE,self.app_entry,None,APP,BASE+0x1ffff)
-        self.uc.reg_write(UC_ARM_REG_SP,0x20010000);self.uc.reg_write(UC_ARM_REG_XPSR,0x01000000)
+        assert self.get(BASE)==RAM_END
+        self.uc.reg_write(UC_ARM_REG_SP,self.get(BASE));self.uc.reg_write(UC_ARM_REG_XPSR,0x01000000)
         self.pc=self.get(BASE+4);self.run()
     def get(self,a):return int.from_bytes(self.uc.mem_read(a,4),'little')
     def put(self,a,v,n=4):self.uc.mem_write(a,v.to_bytes(n,'little'))
@@ -114,16 +117,16 @@ def main():
     b=Board(device_id=0x10036414);b.advance(10001);assert b.jumped
     b=Board();b.request(0x11,1);b.advance(30001);assert b.jumped
     for settings in ({'geometry':128},{'geometry':512},{'device_id':0x410},
-                     {'device_id':0xffffffff},{'cpuid':0x410fc241}):
+                     {'device_id':0xffffffff},{'cpuid':0x410fc231 if BOARD=='m4-48k' else 0x410fc241}):
         b=Board(**settings);b.advance(10001);assert not b.jumped
         assert b.request(0x11,1)[1]==6 and not b.erases and not b.programs
     b=Board();assert b.request(0x11,2)==(0x11,0,0,0x1e000,1,0x10303)
     corrupt=bytearray(frame(0x12,3,bytes(16)));corrupt[-1]^=1;b.rx.extend(corrupt);b.run()
     assert not b.tx and not b.erases
-    image=bytearray((i*23&255 for i in range(768)));struct.pack_into('<II',image,0,0x20010000,APP+305)
+    image=bytearray((i*23&255 for i in range(768)));struct.pack_into('<II',image,0,RAM_END,APP+305)
     crc=zlib.crc32(image);begin=struct.pack('<4I',APP,len(image),crc,0x10303)
     assert b.request(0x12,4,begin)[1:]==(0,0,len(image),crc,0x10303)
-    assert b.get(APP)==0x20010000 # Original application still in place.
+    assert b.get(APP)==RAM_END # Original application still in place.
     for offset in range(0,len(image),60):
         p=struct.pack('<I',offset)+image[offset:offset+60]
         reply=b.request(0x13,10+offset//60,p)

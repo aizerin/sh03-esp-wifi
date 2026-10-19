@@ -81,7 +81,7 @@ do not perform this modification.
 
 You will need an ST-Link programmer, an ESP32-C3 Super Mini, suitable wiring,
 and a computer with Git, Python 3, Make, an ARM GNU toolchain
-(`arm-none-eabi-gcc`), and the [stlink tools](https://github.com/stlink-org/stlink).
+(`arm-none-eabi-gcc` and `arm-none-eabi-gdb`), and the [stlink tools](https://github.com/stlink-org/stlink).
 The examples below use a macOS/Linux shell and run from the **repository root**.
 They install the custom firmware with OTA support.
 
@@ -122,9 +122,63 @@ With the target correctly powered and ST-Link connected to USB, inspect it:
 st-info --probe
 ```
 
-The expected target profile is `F1xx_HD`, chip ID `0x414`, **256 KiB flash and
-64 KiB RAM**. Stop if the detected hardware differs; the OTA layout assumes
-this profile.
+The OTA layout requires **256 KiB flash with 2 KiB pages** and compatible chip
+ID `0x414`. **Do not select a firmware build from `st-info` alone:** it can report
+`F1xx_HD` and 64 KiB RAM for both the Cortex-M3 board and a Cortex-M4 board whose
+upper 64 KiB stack address is inaccessible. The firmware must be built for the
+actual processor and RAM profile.
+
+#### Identify the processor and select the build profile
+
+Read the processor's CPUID through ST-Link. In one terminal, start the GDB server:
+
+```sh
+st-util --no-reset
+```
+
+In a second terminal, run GDB; no firmware build or chip photo is needed:
+
+```sh
+arm-none-eabi-gdb -q
+```
+
+At the GDB prompt, enter:
+
+```text
+target extended-remote localhost:4242
+x/wx 0xe000ed00
+x/wx 0xe0042000
+x/hx 0x1ffff7e0
+disconnect
+quit
+```
+
+The first value is **CPUID**, the second is the debug device ID, and the third
+is the flash size in KiB (`0x0100` means 256 KiB). The CPUID part-number field,
+bits 15–4, is `0xC23` for Cortex-M3 and `0xC24` for Cortex-M4; other CPUID bits
+can vary with core revision. Stop `st-util` with Ctrl+C after reading the values.
+Debugging may pause execution; power-cycle the target before checking normal
+standalone startup.
+
+Select **one** profile in the shell used for the following build commands:
+
+| Measured hardware | CPUID example | Profile selection |
+| --- | --- | --- |
+| Cortex-M3, 64 KiB RAM | `0x411fc231` | `export SH03_BOARD=m3-64k` |
+| Measured Cortex-M4 variant, 48 KiB RAM ceiling | `0x410fc241` | `export SH03_BOARD=m4-48k` |
+
+CPUID identifies the core, not the exact manufacturer, MCU model, or RAM size.
+The M4 profile is for the measured SH03 variant described in
+[board profiles](custom-functionality/docs/board-profiles.md), not arbitrary M4
+boards. The measured M4 unit reports debug ID `0x21040414` and 256 KiB flash;
+its exact part number is unconfirmed. If your hardware does not match a verified
+profile, establish compatibility before flashing.
+
+**The default, when `SH03_BOARD` is unset, is `m3-64k`.** Installing that image
+on the measured M4 board causes a HardFault before GPIO initialization: the
+displays remain blank and the fans may run immediately. Use `m4-48k` for that
+unit, including every future OTA application build. A firmware dump alone does
+not identify the processor: the original dumps from these two units were identical.
 
 ### 3. Build and flash the dryer firmware
 
@@ -143,13 +197,18 @@ Continue only if both reads succeed and `cmp` reports no differences (exit statu
 0, no output). This saves internal flash, not option bytes or a complete image
 of every component in the dryer. Local backups are ignored by Git.
 
-Build the bootloader, application, and initial installation image:
+With `SH03_BOARD` exported as selected in step 2, build the bootloader,
+application, and initial installation image:
 
 ```sh
 make -C custom-functionality ota CROSS_COMPILE=arm-none-eabi-
 ```
 
 If using the default PlatformIO ARM toolchain path, omit `CROSS_COMPILE`.
+Before flashing, check `custom-functionality/build/ota/manifest.json`: its `board`
+must match the selected profile and `ram_bytes` must be 65536 for `m3-64k` or
+49152 for `m4-48k`. Both profiles use the same output paths, so building another
+profile replaces these files. Retain each unit's image and manifest with its backup.
 The two main outputs are:
 
 | File | Purpose |
@@ -255,7 +314,9 @@ Replace the hostname with the ESP32 IP address if necessary. This updates the
 ESP32 only. See the [ESPHome CLI documentation](https://esphome.io/guides/cli/).
 
 **SH03 dryer application:** exit panel editing/diagnostics, rebuild the OTA package,
-and upload it through the ESP32's encrypted API:
+and upload it through the ESP32's encrypted API. First export the **same
+`SH03_BOARD` used for that unit's initial installation** (see step 2). Set it
+again if using a new shell; omitting it silently selects `m3-64k`.
 
 ```sh
 make -C custom-functionality ota CROSS_COMPILE=arm-none-eabi-

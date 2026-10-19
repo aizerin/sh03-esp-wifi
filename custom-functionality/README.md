@@ -97,13 +97,24 @@ Only the YAML and your credentials in `secrets.yaml` are needed.
 For the existing **filament-dryer-01**, always copy the **entire current
 [sh03.yaml](esphome/sh03.yaml)** into the device configuration in ESPHome Device
 Builder and select Install. The file already includes its name, RX=GPIO21 /
-TX=GPIO20 wiring, both Wi-Fi networks, `power_save_mode: none`, `8.5dB` transmit
-power, and the latest controls including displays. Keep the existing ESPHome
+TX=GPIO20 wiring, both Wi-Fi networks, automatic Wi-Fi recovery, and the latest
+controls including displays. Keep the existing ESPHome
 `secrets.yaml` unchanged; it uses the existing names `wifi_ssid`, `wifi_ssid_2`,
 `wifi_password`, `filament_dryer_01__api_key` (two underscores before `api`),
 and `ota_password`. Subsequent updates do not require re-entering pins or Wi-Fi
 settings, or merging individual lambdas. `secrets.example.yaml` is only a template
 for a new installation; it does not replace your existing secrets.
+
+Wi-Fi starts with ESPHome/driver defaults (`LIGHT` power saving on ESP32 and no
+explicit TX power override). The first native `WIFI_REASON_AUTH_EXPIRE` event,
+including a failed initial connection, enables `power_save_mode: none` and an
+`8.5dB` TX limit on the next one-second polling tick. Other disconnect reasons do
+not enable it.
+The workaround stays active across reconnects and Wi-Fi restarts until the ESP32
+reboots; each boot tries defaults again. Logs under `wifi_fallback` show activation
+and any failed driver calls, which are retried. This is a compatibility workaround,
+not a guarantee that every authentication timeout will be fixed. The native ESP-IDF
+headers are included directly from the framework; no extra files are required.
 
 For a new local installation:
 

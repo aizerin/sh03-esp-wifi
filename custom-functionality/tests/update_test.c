@@ -41,7 +41,7 @@ static void manifest(uint32_t address,const uint8_t *data,unsigned size)
 static void create_image(unsigned size,unsigned seed)
 {
     for (unsigned i=0;i<size;++i) image[i]=(uint8_t)(i*73+seed);
-    sh03_put32(image,0x20010000);sh03_put32(image+4,SH03_APP_BASE+305);
+    sh03_put32(image,SH03_RAM_END);sh03_put32(image+4,SH03_APP_BASE+305);
 }
 static void begin_payload(uint8_t *p,unsigned size)
 {
@@ -106,6 +106,8 @@ static void boundaries(void)
     assert(sh03_update_end(&u)==SH03_UPDATE_CRC && sh03_active_valid());
     /* A correctly checksummed package with invalid vectors must still fail. */
     create_image(512,3);sh03_put32(image+4,0x08000001);u.receiving=0;download(&u,512);
+    assert(sh03_update_end(&u)==SH03_UPDATE_CRC && sh03_active_valid());
+    create_image(512,3);sh03_put32(image,SH03_RAM_END+8);u.receiving=0;download(&u,512);
     assert(sh03_update_end(&u)==SH03_UPDATE_CRC && sh03_active_valid());
     create_image(512,3);u.receiving=0;download(&u,512);assert(sh03_update_end(&u)==0);
     before=events;begin_payload(p,512);assert(sh03_update_begin(&u,p)==SH03_UPDATE_BUSY && events==before);

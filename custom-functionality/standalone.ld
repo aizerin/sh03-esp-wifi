@@ -4,9 +4,9 @@ ENTRY(Reset_Handler)
 MEMORY {
     FLASH (rx) : ORIGIN = DEFINED(OTA_APP) ? 0x08002000 : 0x08000000, LENGTH = DEFINED(OTA_APP) ? 120K : 256K
     APP (rw) : ORIGIN = 0x20000000, LENGTH = 0x700
-    RAM (rwx) : ORIGIN = 0x20000700, LENGTH = 0xf900
+    RAM (rwx) : ORIGIN = 0x20000700, LENGTH = (DEFINED(SH03_RAM_BYTES) ? SH03_RAM_BYTES : 0x10000) - 0x700
 }
-_stack_top = 0x20010000;
+_stack_top = ORIGIN(RAM) + LENGTH(RAM);
 SECTIONS {
     .vectors ORIGIN(FLASH) : { KEEP(*(.vectors)) } > FLASH
     .text : { *(.text*) *(.rodata*) } > FLASH

@@ -4,6 +4,13 @@ import os
 
 ROOT=Path(__file__).resolve().parents[1]
 PREFIX=os.environ.get('CROSS_COMPILE',str(Path.home()/'.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-'))
+BOARD=os.environ.get('SH03_BOARD','m3-64k')
+if BOARD not in ('m3-64k','m4-48k'):
+    raise ValueError('SH03_BOARD must be m3-64k or m4-48k')
+RAM_BYTES=0xc000 if BOARD=='m4-48k' else 0x10000
+RAM_END=0x20000000+RAM_BYTES
+BOARD_CFLAGS=['-DSH03_BOARD_M4_48K'] if BOARD=='m4-48k' else []
+BOARD_LDFLAGS=[f'-Wl,--defsym,SH03_RAM_BYTES={RAM_BYTES}']
 REPLACEMENTS={
     0x080045bc:'sh03_ntc_read_temperature',
     0x0800512c:'sh03_ntc_adc_to_temperature',

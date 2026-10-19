@@ -8,12 +8,15 @@ from unicorn.arm_const import UC_ARM_REG_SP,UC_ARM_REG_LR,UC_ARM_REG_XPSR,UC_ARM
 
 # Use the existing real RTOS/UART harness against the factory image.
 from test_link import Link,frame,frames,main as link_regressions
+from build_config import BOARD,RAM_BYTES,RAM_END
 
 def main():
     m=system.System(initialized=False)
     m.uc.mem_map(0x1ffff000,0x1000);m.uc.mem_write(0x1ffff7e0,struct.pack('<H',256))
     m.uc.mem_map(0xe0042000,0x1000);m.put32(0xe0042000,0) # No debugger: ES0340.
-    m.put32(0xe000ed00,0x411fc231)
+    m.put32(0xe000ed00,0x410fc241 if BOARD=='m4-48k' else 0x411fc231)
+    # Real startup must fit the selected SRAM, including every stack access.
+    if RAM_BYTES<0x10000:m.uc.mem_unmap(0x20000000+RAM_BYTES,0x10000-RAM_BYTES)
     time=0;heater_off=[];handoff=[];backlight=[]
     def read(uc,access,address,size,value,data):
         nonlocal time
@@ -37,11 +40,13 @@ def main():
     from unicorn import UC_HOOK_CODE
     m.uc.hook_add(UC_HOOK_CODE,app_entry,None,system.SYMBOLS['Reset_Handler'],system.SYMBOLS['Reset_Handler'])
     stop_hook=m.stop_at('vTaskStartScheduler')
-    m.uc.reg_write(UC_ARM_REG_SP,0x20010000);m.uc.reg_write(UC_ARM_REG_XPSR,0x01000000)
+    m.uc.reg_write(UC_ARM_REG_SP,m.get32(0x08000000));m.uc.reg_write(UC_ARM_REG_XPSR,0x01000000)
     m.uc.emu_start(m.get32(0x08000004),system.STOP,count=15000000)
     assert m.stop_reason=='vTaskStartScheduler'
     m.uc.hook_del(stop_hook)
-    assert handoff==[(0x08002000,0x20010000,0)]
+    assert handoff==[(0x08002000,RAM_END,0)]
+    # Subsequent unit calls use the harness's out-of-band scratch stack.
+    if RAM_BYTES<0x10000:m.uc.mem_map(0x20000000+RAM_BYTES,0x10000-RAM_BYTES)
     assert backlight==[0,1], 'Startup must enable backlights without repeating the diagnostic pulse'
     assert heater_off and heater_off[0]==0x00c00000
     assert m.get32(0xe000ed08)==0x08002000

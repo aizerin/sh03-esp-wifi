@@ -1,6 +1,7 @@
 #ifndef SH03_UPDATE_H
 #define SH03_UPDATE_H
 #include "sh03_protocol.h"
+#include "sh03_board.h"
 
 /* F1 high-density, 256 KiB flash, 2 KiB erase pages. Layout version 1. */
 #define SH03_APP_BASE 0x08002000u

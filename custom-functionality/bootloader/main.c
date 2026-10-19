@@ -104,12 +104,12 @@ void Boot_Reset(void)
     hardware_init();
     /* STM32F1 ES0340: DBGMCU_IDCODE reads as zero without a debugger.
      * This loader targets the externally verified 256-KiB F1-HD board.
-     * Check flash size and ARM Cortex-M3 CPUID in normal operation; reject
+     * Check flash size and the explicitly selected core profile; reject
      * a conflicting device ID when debug identification is available.
      * CPUID mask ignores only core variant and revision. */
     uint32_t device_id=R32(0xe0042000);
     int hardware_ok=R16(0x1ffff7e0)==256 &&
-        (R32(0xe000ed00)&0xff0ffff0u)==0x410fc230u &&
+        (R32(0xe000ed00)&0xff0ffff0u)==SH03_CORE_ID &&
         (device_id==0 || (device_id&0xfff)==0x414);
     int ready=hardware_ok && sh03_install_pending();
     Sh03Update update={0}; Sh03WireParser parser={0};

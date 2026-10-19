@@ -14,7 +14,7 @@ static int vectors_valid(uint32_t base,uint32_t size)
 {
     const uint8_t *p=sh03_flash_at(base);
     uint32_t sp=sh03_get32(p),reset=sh03_get32(p+4);
-    return sp>0x20000700u && sp<=0x20010000u && !(sp&7) && (reset&1) &&
+    return sp>0x20000700u && sp<=SH03_RAM_END && !(sp&7) && (reset&1) &&
            (reset&~1u)>=SH03_APP_BASE+76*4 && (reset&~1u)<SH03_APP_BASE+size;
 }
 int sh03_manifest_valid(uint32_t address)

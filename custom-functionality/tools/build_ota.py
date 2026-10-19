@@ -2,6 +2,7 @@
 """Build the loader, relocated application, factory image and OTA package."""
 import hashlib,json,struct,subprocess,zlib
 from build_standalone import ROOT,PREFIX,main as build_app,run
+from build_config import BOARD,RAM_BYTES,RAM_END,BOARD_CFLAGS,BOARD_LDFLAGS
 
 def main():
     build_app(ota=True)
@@ -10,13 +11,13 @@ def main():
     build=ROOT/output;build.mkdir(parents=True,exist_ok=True)
     flags=['-mcpu=cortex-m3','-mthumb','-mfloat-abi=soft','-Os','-std=gnu11',
            '-ffreestanding','-fno-builtin','-ffunction-sections','-fdata-sections',
-           '-Wall','-Wextra','-Werror','-Iinclude','-g']
+           '-Wall','-Wextra','-Werror','-Iinclude','-g',*BOARD_CFLAGS]
     objects=[]
     for name in ('main','update'):
         obj=build/(name+'.o');objects.append(str(obj))
         run([PREFIX+'gcc',*flags,'-c',f'bootloader/{name}.c','-o',str(obj)])
     elf=str(build/'bootloader.elf')
-    run([PREFIX+'gcc',*flags,'-nostdlib',f'-Wl,--gc-sections,-T,bootloader/bootloader.ld,-Map,{output}/bootloader.map',*objects,'-lgcc','-o',elf])
+    run([PREFIX+'gcc',*flags,'-nostdlib',*BOARD_LDFLAGS,f'-Wl,--gc-sections,-T,bootloader/bootloader.ld,-Map,{output}/bootloader.map',*objects,'-lgcc','-o',elf])
     run([PREFIX+'objcopy','-O','binary',elf,str(build/'bootloader.bin')])
     assert not subprocess.check_output([PREFIX+'nm','-u',elf],text=True).strip()
     boot=(build/'bootloader.bin').read_bytes()
@@ -24,7 +25,8 @@ def main():
     app+=b'\xff'*(-len(app)%4)
     assert len(boot)<=0x2000 and 304<=len(app)<=0x1e000
     sp,reset=struct.unpack_from('<II',app)
-    assert sp==0x20010000 and reset&1 and 0x08002130<=reset<0x08002000+len(app)
+    assert sp==RAM_END and reset&1 and 0x08002130<=reset<0x08002000+len(app)
+    assert struct.unpack_from('<I',boot)[0]==RAM_END
     header=struct.pack('<6I',0x55333053,1,0x08002000,len(app),zlib.crc32(app),0x00010303)
     header+=struct.pack('<II',zlib.crc32(header),0x5aa5a55a)
     (build/'application.sh03').write_bytes(header+app)
@@ -32,7 +34,7 @@ def main():
     factory[:len(boot)]=boot;factory[0x2000:0x2000+len(app)]=app
     factory[0x3e800:0x3e820]=header
     (build/'factory.bin').write_bytes(factory)
-    report={'layout':'00010303','bootloader_bytes':len(boot),'application_bytes':len(app),
+    report={'board':BOARD,'ram_bytes':RAM_BYTES,'layout':'00010303','bootloader_bytes':len(boot),'application_bytes':len(app),
             'application_crc32':f'{zlib.crc32(app):08x}',
             'files':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in [build/'bootloader.bin',build/'factory.bin',build/'application.sh03']}}
     (build/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')

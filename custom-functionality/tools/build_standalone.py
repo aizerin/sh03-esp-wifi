@@ -7,7 +7,7 @@ Original addresses are retained as provenance keys in a checked call resolver.
 """
 from pathlib import Path
 import argparse,hashlib,json,re,struct,subprocess
-from build_config import ROOT,PREFIX,REPLACEMENTS,SOURCES
+from build_config import ROOT,PREFIX,REPLACEMENTS,SOURCES,BOARD,RAM_BYTES,BOARD_CFLAGS,BOARD_LDFLAGS
 
 RUNTIME={
     0x08002bc0:'sh03_delete_task_handle',0x0800ae8c:'sh03_debug_printf',
@@ -75,12 +75,13 @@ def main(ota=False):
            '-Os','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-override-init','-fstack-usage','-DSH03_STANDALONE','-DSH03_CUSTOM_UART',
            '-Iinclude',f'-I{kernel}/include',f'-I{kernel}/portable/GCC/ARM_CM3']
     if ota: flags+=['-DSH03_OTA_APP']
+    flags+=BOARD_CFLAGS
     objects=[]
     for source in sources:
         obj=build/(source.replace('/','_').removesuffix('.c')+'.o');objects.append(str(obj))
         run([PREFIX+'gcc',*flags,'-c',source,'-o',str(obj)])
     extra=['-Wl,--defsym,OTA_APP=1'] if ota else []
-    run([PREFIX+'gcc',*flags,'-nostdlib',*extra,f'-Wl,-T,standalone.ld,-Map,{output}/firmware.map',*objects,'-lgcc','-o',output+'/firmware.elf'])
+    run([PREFIX+'gcc',*flags,'-nostdlib',*extra,*BOARD_LDFLAGS,f'-Wl,-T,standalone.ld,-Map,{output}/firmware.map',*objects,'-lgcc','-o',output+'/firmware.elf'])
     for fmt,suffix in [('binary','bin'),('ihex','hex')]:run([PREFIX+'objcopy','-O',fmt,output+'/firmware.elf',f'{output}/firmware.{suffix}'])
     nm=subprocess.check_output([PREFIX+'nm','-n',str(build/'firmware.elf')],text=True)
     symbols={l.split()[2]:int(l.split()[0],16) for l in nm.splitlines() if len(l.split())==3}
@@ -88,7 +89,7 @@ def main(ota=False):
     offset=0x08010b74-base
     assert blob[offset:offset+len(tables)]==tables
     assert not subprocess.check_output([PREFIX+'nm','-u',str(build/'firmware.elf')],text=True).strip()
-    report={'sha256':hashlib.sha256(blob).hexdigest(),'bytes':len(blob),'source_only':True,'custom_uart':True,'ota':ota,'flash_base':hex(base),'kernel_version':'V11.1.0',
+    report={'board':BOARD,'ram_bytes':RAM_BYTES,'sha256':hashlib.sha256(blob).hexdigest(),'bytes':len(blob),'source_only':True,'custom_uart':True,'ota':ota,'flash_base':hex(base),'kernel_version':'V11.1.0',
             'sources':sources,'source_hashes':{s:hashlib.sha256((ROOT/s).read_bytes()).hexdigest() for s in sources},
             'bss_end':f'{symbols["_bss_end"]:08x}','stack_top':f'{symbols["_stack_top"]:08x}',
             'functions':{f'{old:08x}':{'symbol':name,'address':f'{symbols[name]:08x}'} for old,name in sorted(mapping.items())},

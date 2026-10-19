@@ -79,7 +79,7 @@ class System:
 def reset_test():
     m=System(initialized=False);m.uc.mem_write(RAM,bytes([0xa5])*0x10000)
     vectors=struct.unpack_from('<76I',BLOB,0x2000 if OTA else 0)
-    assert vectors[0]==0x20010000
+    assert vectors[0]==int(MANIFEST['stack_top'],16)
     for index,name in [(1,'Reset_Handler'),(11,'SVC_Handler'),(14,'PendSV_Handler'),(15,'SysTick_Handler'),
                        (25,'sh03_touch_irq'),(30,'sh03_dma1_channel4_irq'),(31,'sh03_dma1_channel5_irq'),(75,'sh03_dma2_channel4_5_irq'),(68,'sh03_uart4_irq')]:
         assert vectors[index]==SYMBOLS[name]|1

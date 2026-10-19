@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compile and run the actual lambdas extracted from sh03.yaml.
 
-Only ESPHome UART/entities/time are stubbed. Compare the wire bytes against the
-MCU protocol header. An actual ESP-IDF compile checks framework compatibility.
+ESPHome UART/entities/time and native Wi-Fi events/driver calls are stubbed.
+Compare wire bytes against the MCU protocol header. An actual ESP-IDF compile
+checks framework compatibility; host tests cannot verify radio connectivity.
 """
 from pathlib import Path
 import hashlib, json, os, re, subprocess, tempfile
@@ -13,6 +14,7 @@ CONFIG=ROOT/'esphome/sh03.yaml'
 
 STUB=r'''
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +27,49 @@ STUB=r'''
 #include <string>
 #include <vector>
 #include "sh03_protocol.h"
+using esp_err_t = int;
+using esp_event_base_t = const char *;
+constexpr int ESP_OK=0, ESP_EVENT_ANY_ID=-1;
+constexpr int WIFI_EVENT_STA_START=2, WIFI_EVENT_STA_DISCONNECTED=5;
+constexpr int WIFI_REASON_AUTH_EXPIRE=2, WIFI_PS_NONE=0;
+constexpr esp_event_base_t WIFI_EVENT="WIFI_EVENT";
+struct wifi_event_sta_disconnected_t {uint8_t reason;};
+namespace wifi {constexpr int WIFI_POWER_SAVE_NONE=0;}
+struct WifiRadio {
+ int power_save=1; float output_power=NAN;
+ void set_power_save_mode(int mode) {power_save=mode;}
+ void set_output_power(float power) {output_power=power;}
+};
+struct WifiDriver {
+ void (*callback)(void *,esp_event_base_t,int32_t,void *)=nullptr;
+ void *arg=nullptr;
+ int register_error=0,ps_error=0,tx_error=0,ps_calls=0,tx_calls=0;
+ int power_save=1,tx_power=80;
+ void emit(int event_id,void *data=nullptr) {assert(callback);callback(arg,WIFI_EVENT,event_id,data);}
+ void disconnect(uint8_t reason) {wifi_event_sta_disconnected_t event{reason};emit(WIFI_EVENT_STA_DISCONNECTED,&event);}
+};
+inline WifiDriver wifi_driver;
+esp_err_t esp_event_handler_register(esp_event_base_t base,int id,
+ void (*callback)(void *,esp_event_base_t,int32_t,void *),void *arg) {
+ assert(base==WIFI_EVENT && id==ESP_EVENT_ANY_ID);
+ if(wifi_driver.register_error)return wifi_driver.register_error;
+ wifi_driver.callback=callback;wifi_driver.arg=arg;return ESP_OK;
+}
+esp_err_t esp_wifi_set_ps(int mode) {
+ ++wifi_driver.ps_calls;
+ if(!wifi_driver.ps_error)wifi_driver.power_save=mode;
+ return wifi_driver.ps_error;
+}
+esp_err_t esp_wifi_set_max_tx_power(int8_t power) {
+ ++wifi_driver.tx_calls;
+ if(!wifi_driver.tx_error)wifi_driver.tx_power=power;
+ return wifi_driver.tx_error;
+}
+const char *esp_err_to_name(esp_err_t error) {return error ? "FAILED" : "ESP_OK";}
+template<typename... Args> void fake_log(const char *,const char *,Args...) {}
+#define ESP_LOGE(...) fake_log(__VA_ARGS__)
+#define ESP_LOGW(...) fake_log(__VA_ARGS__)
+#define ESP_LOGI(...) fake_log(__VA_ARGS__)
 inline uint32_t fake_time=100,read_advance=0;
 uint32_t millis() { return fake_time; }
 uint32_t random_uint32() { return 123; }
@@ -82,6 +127,44 @@ struct BootScript {
 };
 '''
 TEST=r'''
+static void test_wifi_fallback() {
+ wifi_driver={};Bridge b;b.wifi_boot();b.wifi_tick();
+ assert(!b.wifi_fallback_active && b.wifi_radio.power_save==1 && std::isnan(b.wifi_radio.output_power));
+ assert(wifi_driver.ps_calls==0 && wifi_driver.tx_calls==0);
+ wifi_driver.emit(WIFI_EVENT_STA_START);b.wifi_tick();
+ // Ordinary disconnects and null event payloads leave defaults untouched.
+ for(int reason:{1,3,8,15,200,201,202,204}) {wifi_driver.disconnect(reason);b.wifi_tick();}
+ wifi_driver.emit(WIFI_EVENT_STA_DISCONNECTED);b.wifi_tick();
+ assert(!b.wifi_fallback_active && wifi_driver.ps_calls==0 && wifi_driver.tx_calls==0);
+ // No successful connection is needed; AUTH_EXPIRE on the first attempt works.
+ wifi_driver.disconnect(WIFI_REASON_AUTH_EXPIRE);
+ assert(!b.wifi_fallback_active && wifi_driver.ps_calls==0); // callback only queues
+ wifi_driver.emit(WIFI_EVENT_STA_START);b.wifi_tick(); // coalesced events retain AUTH_EXPIRE
+ assert(b.wifi_fallback_active && !b.wifi_fallback_retry);
+ assert(b.wifi_radio.power_save==0 && b.wifi_radio.output_power==8.5f);
+ assert(wifi_driver.power_save==WIFI_PS_NONE && wifi_driver.tx_power==34);
+ assert(wifi_driver.ps_calls==1 && wifi_driver.tx_calls==1);
+ for(int i=0;i<10;++i)b.wifi_tick();
+ wifi_driver.emit(4);wifi_driver.disconnect(200);b.wifi_tick();
+ assert(b.wifi_fallback_active && wifi_driver.ps_calls==1 && wifi_driver.tx_calls==1);
+ // Driver restart reapplies the workaround, without returning to defaults.
+ wifi_driver.power_save=1;wifi_driver.tx_power=80;
+ wifi_driver.emit(WIFI_EVENT_STA_START);b.wifi_tick();
+ assert(wifi_driver.power_save==0 && wifi_driver.tx_power==34 && wifi_driver.tx_calls==2);
+ // Partial failures keep the retry pending until BOTH settings are applied.
+ wifi_driver.ps_error=1;wifi_driver.emit(WIFI_EVENT_STA_START);b.wifi_tick();
+ assert(b.wifi_fallback_retry);
+ wifi_driver.ps_error=0;wifi_driver.tx_error=1;b.wifi_tick();assert(b.wifi_fallback_retry);
+ wifi_driver.tx_error=0;b.wifi_tick();assert(!b.wifi_fallback_retry);
+ int calls=wifi_driver.tx_calls;b.wifi_tick();assert(wifi_driver.tx_calls==calls);
+ // A fresh boot starts at defaults; nothing is saved to flash.
+ wifi_driver={};Bridge fresh;fresh.wifi_boot();wifi_driver.emit(WIFI_EVENT_STA_START);fresh.wifi_tick();
+ assert(!fresh.wifi_fallback_active && fresh.wifi_radio.power_save==1 && std::isnan(fresh.wifi_radio.output_power));
+ assert(wifi_driver.ps_calls==0 && wifi_driver.tx_calls==0);
+ wifi_driver={};wifi_driver.register_error=1;Bridge failed;failed.wifi_boot();failed.wifi_tick();
+ assert(!wifi_driver.callback && !failed.wifi_fallback_active && wifi_driver.tx_calls==0);
+ wifi_driver={};
+}
 static std::vector<uint8_t> make_frame(uint8_t type,uint16_t sequence,const uint8_t *p,uint8_t n) {
  uint8_t frame[SH03_WIRE_FRAME];auto size=sh03_wire_encode(frame,type,sequence,p,n);
  return {frame,frame+size};
@@ -95,6 +178,7 @@ static void ack(Bridge &b,uint16_t seq,uint8_t op,uint8_t result) {
  uint8_t p[3]={0,op,result};input(b,make_frame(3,seq,p,3));
 }
 int main() {
+ test_wifi_fallback();
  Bridge b;b.boot();
  assert(!b.uart_connected.state && b.dryer_uart.tx.empty());
  assert(std::isnan(b.ch1_target_temperature.state));
@@ -227,7 +311,7 @@ int main() {
  preferences.fail_sync=true;b.ota_recovery(1);assert(!b.recovery_saved);
  preferences.dirty=false;preferences.fail_sync=false;preferences.fail_save=true;
  b.ota_recovery(1);assert(!b.recovery_saved);preferences.fail_save=false;
- std::cout<<"PASS: YAML lambdas, canonical wire bytes, CRC/fragmentation/noise, confirmed controls, ACK matching, timeout/reconnect, clock advance/wrap\n";
+ std::cout<<"PASS: YAML lambdas, Wi-Fi AUTH_EXPIRE fallback/restart/retry, canonical wire bytes, CRC/fragmentation/noise, confirmed controls, ACK matching, timeout/reconnect, clock advance/wrap\n";
 }
 '''
 
@@ -236,12 +320,14 @@ def main():
     Loader.add_constructor('!secret',lambda loader,node:loader.construct_scalar(node))
     Loader.add_constructor('!lambda',lambda loader,node:loader.construct_scalar(node))
     config=yaml.load(CONFIG.read_text(),Loader=Loader)
-    assert 'external_components' not in config and 'includes' not in config['esphome']
+    assert 'external_components' not in config
+    assert set(config['esphome']['includes'])=={'<esp_event.h>','<esp_wifi.h>'}
+    assert 'power_save_mode' not in config['wifi'] and 'output_power' not in config['wifi']
     groups={'sensor':'sensor::Sensor','binary_sensor':'binary_sensor::BinarySensor',
             'text_sensor':'text_sensor::TextSensor','number':'number::Number',
             'switch':'switch_::Switch','select':'select::Select'}
     globals_={g['id'] for g in config['globals']}
-    entities={e['id'] for group in groups for e in config[group]}|{'dryer_uart','sh03_command','sh03_boot_control'}
+    entities={e['id'] for group in groups for e in config[group]}|{'dryer_uart','sh03_command','sh03_boot_control','wifi_radio'}
     def transform(code):
         def replace(match):
             name=match[1]
@@ -249,10 +335,10 @@ def main():
             return name if name in globals_ or code[match.end():].startswith('.') else f'(&{name})'
         return re.sub(r'id\((\w+)\)',replace,code)
     def body(actions):return transform(actions[0]['lambda'])
-    cpp=[STUB,'struct Bridge {','UART dryer_uart; Script sh03_command; BootScript sh03_boot_control;']
+    cpp=[STUB,'struct Bridge {','UART dryer_uart; Script sh03_command; BootScript sh03_boot_control; WifiRadio wifi_radio;']
     for g in config['globals']:
         assert not g['restore_value']
-        cpp.append(f'{g["type"]} {g["id"]} = {g["initial_value"]};')
+        cpp.append(f'{g["type"]} {g["id"]} = {g.get("initial_value", "{}")} ;')
     for group,type_ in groups.items():
         for e in config[group]:cpp.append(f'{type_} {e["id"]};')
     cpp.append('Bridge() { sh03_command.callback=[this](int ch,int operation,int value) {send(ch,operation,value);};')
@@ -263,7 +349,10 @@ def main():
         if e['id'].endswith('_material'):assert e['options']==materials
         cpp.append(e['id']+'.options={'+','.join(json.dumps(s) for s in e['options'])+'};')
     cpp.append('}')
-    cpp.append('void boot() {'+body(config['esphome']['on_boot']['then'])+'}')
+    boot={entry['priority']:entry['then'] for entry in config['esphome']['on_boot']}
+    cpp.append('void boot() {'+body(boot[500])+'}')
+    cpp.append('void wifi_boot() {'+body(boot[275])+'}')
+    cpp.append('void wifi_tick() {'+body(next(i['then'] for i in config['interval'] if i['interval']=='1s'))+'}')
     cpp.append('void send(int ch,int operation,int value) {'+body(config['script'][0]['then'])+'}')
     cpp.append('void boot_control(int operation) {'+body(config['script'][1]['then'])+'}')
     cpp.append('void recovery_tick() {'+body(next(i['then'] for i in config['interval'] if i['interval']=='250ms'))+'}')
@@ -287,7 +376,7 @@ def main():
             '-fsanitize=address,undefined','-fno-omit-frame-pointer','-g','-I'+str(ROOT/'include'),str(source),'-o',str(temp/'test')],check=True)
         subprocess.run([str(temp/'test')],check=True)
     report={'status':'PASS','yaml_sha256':hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
-      'scope':'Actual YAML lambdas with stub UART/entities/time, canonical MCU protocol frames and host address/UB sanitizers; no Wi-Fi or board simulation'}
+      'scope':'Actual YAML lambdas with stub UART/entities/time and native Wi-Fi events/driver calls, canonical MCU protocol frames and host address/UB sanitizers; no radio or board simulation'}
     directory=ROOT/'analysis/standalone';directory.mkdir(parents=True,exist_ok=True)
     (directory/'esphome-tests.json').write_text(json.dumps(report,indent=2)+'\n')
 
